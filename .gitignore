@@ -1,0 +1,6 @@
+# Ignore all .exe files
+*.exe
+Config.json
+Blacklist.txt
+Whitelist.txt
+TrashMetrics.txt
