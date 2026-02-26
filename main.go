@@ -262,6 +262,9 @@ func MatchFilter(msg *imap.Message, filterPhrase string) bool {
         return false // Skip filtering if the email is in the whitelist
       }
     }
+    TrashCode = 1
+    IncrementTrashMetric("NotWhiteList", 1)
+    return true
   }
   // If the filter phrase is empty, match all emails
   if filterPhrase == "" {

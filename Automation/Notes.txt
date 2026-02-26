@@ -1,0 +1,2 @@
+To see status of SpamBeGone schedule:
+schtasks /query /tn "\SpamBeGone" /v /fo list | findstr /i "Status Last Run Result Task To Run"
