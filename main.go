@@ -254,14 +254,15 @@ func FetchAndStoreEmails() {
 
 // Helper function to check if an email matches the filter phrases
 func MatchFilter(msg *imap.Message, filterPhrase string) bool {
-  // Check if the email address is in the whitelist
-  if len(msg.Envelope.From) > 0 {
-    emailAddress := fmt.Sprintf("%s@%s", strings.ToLower(msg.Envelope.From[0].MailboxName), strings.ToLower(msg.Envelope.From[0].HostName))
-    for _, whitelisted := range Whitelist {
-      if emailAddress == whitelisted {
-        return false // Skip filtering if the email is in the whitelist
-      }
+  // Build sender email/domain once
+  emailAddress, fromDomain, ok := BuildFromEmailAddress(msg)
+  if ok {
+    if IsWhitelisted(emailAddress, fromDomain) {
+      return false // never trash whitelisted senders
     }
+
+    // NOTE: keeping your current behavior:
+    // if sender is not whitelisted, it is automatically matched/trash-coded as 1.
     TrashCode = 1
     IncrementTrashMetric("NotWhiteList", 1)
     return true
@@ -311,7 +312,13 @@ func MatchFilter(msg *imap.Message, filterPhrase string) bool {
     return true
   }
   // Check if the From Email Address contains the filter phrase (case-insensitive)
-  emailAddress := fmt.Sprintf("%s@%s", strings.ToLower(msg.Envelope.From[0].MailboxName), strings.ToLower(msg.Envelope.From[0].HostName))
+  // (Re-use built email address if we have it; otherwise build it here)
+  if !ok {
+    emailAddress = fmt.Sprintf("%s@%s",
+      strings.ToLower(msg.Envelope.From[0].MailboxName),
+      strings.ToLower(msg.Envelope.From[0].HostName),
+    )
+  }
   if strings.Contains(emailAddress, filterPhrase) {
     TrashCode = 5
     IncrementTrashMetric(filterPhrase, 5)
@@ -329,7 +336,7 @@ func ContainsUnacceptable(input string) bool {
     }
     if IsEmoji(r) {                 // Character is an emoji
       return true
-    } 
+    }
     if r >= 0x0400 && r <= 0x04FF { // Character is in the Cyrillic range (U+0400–U+04FF)
       return true
     }
@@ -429,11 +436,22 @@ func MoveToTrash() {
     log.Printf("Processing chunk %d: %s", i+1, chunk.String())
     // Copy emails to the Trash folder
     if err := c.UidCopy(chunk, TrashFolder); err != nil {
-      log.Printf("failed to copy emails to trash for chunk %d: %v", i+1, err)
-      continue
+      log.Printf("FATAL: chunk %d copy to %s failed: %s (%v)", i+1, TrashFolder, chunk.String(), err)
+      // Show status of Trash/Bulk
+      VerifyFolderCounts(TrashFolder, "Trash/Bulk Mail")
+      // Clean logout before exiting
+      CloseConnection()
+      os.Exit(1)
     }
+    log.Printf("Processed chunk %d: %s", i+1, chunk.String())
     // Introduce a small delay to avoid rate limits
     time.Sleep(2 * time.Second)
+  }
+  VerifyFolderCounts(TrashFolder, "Trash/Bulk Mail")
+  // Reselect INBOX so session state is clean
+  _, err = c.Select(SelectFolder, false)
+  if err != nil {
+    log.Printf("failed to reselect %s after folder verification: %v", SelectFolder, err)
   }
   // Mark original emails as deleted
   storeFlags := []interface{}{imap.DeletedFlag}
@@ -442,32 +460,97 @@ func MoveToTrash() {
     log.Printf("failed to mark emails as deleted: %v", err)
     return
   }
-  // Expunge deleted emails
-  if err := c.Expunge(nil); err != nil {
-    log.Printf("failed to expunge emails: %v", err)
-    return
-  }
-  log.Printf("%d emails moved to trash successfully.", len(MatchingEmails))
+// Expunge deleted emails
+if err := c.Expunge(nil); err != nil {
+  log.Printf("failed to expunge emails: %v", err)
+  return
+}
+// Confirm INBOX count after expunge
+mbox, err = c.Select(SelectFolder, false)
+if err != nil {
+  log.Printf("failed to reselect %s after expunge: %v", SelectFolder, err)
+} else {
+  log.Printf("Post-expunge: %s now contains %d messages.", SelectFolder, mbox.Messages)
+}
+log.Printf("%d emails moved to trash successfully.", len(MatchingEmails))
 }
 
 // Helper function to split a sequence set into smaller chunks
-func SplitSequenceSet(seqset *imap.SeqSet, chunkSize int) []*imap.SeqSet {
-  var chunks []*imap.SeqSet
-  currentChunk := new(imap.SeqSet)
-  count := 0
-  for _, seq := range seqset.Set {
-    currentChunk.AddNum(seq.Start)
-    count++
-    if count >= chunkSize {
-      chunks = append(chunks, currentChunk)
-      currentChunk = new(imap.SeqSet)
-      count = 0
+// SplitSequenceSet splits an IMAP SeqSet into a slice of SeqSets, each containing
+// at most chunkSize UIDs, while preserving ranges by splitting them into sub-ranges.
+//
+// IMPORTANT: This function must handle seq.Start..seq.Stop ranges correctly.
+// The IMAP library may compress a UID set into ranges (e.g., 506732:506734).
+func SplitSequenceSet(in *imap.SeqSet, chunkSize uint32) []*imap.SeqSet {
+  if in == nil {
+    return nil
+  }
+  if chunkSize == 0 {
+    // Defensive: treat as "no chunking"
+    // (alternatively return nil or panic, but this is safest operationally)
+    return []*imap.SeqSet{in}
+  }
+
+  var out []*imap.SeqSet
+  var cur imap.SeqSet
+  var curCount uint32
+
+  flush := func() {
+    if curCount == 0 {
+      return
+    }
+    // Copy cur into a new SeqSet so we don't keep mutating the same backing store.
+    tmp := &imap.SeqSet{}
+    for _, s := range cur.Set {
+      tmp.AddRange(s.Start, s.Stop)
+    }
+    out = append(out, tmp)
+    cur = imap.SeqSet{}
+    curCount = 0
+  }
+
+  for _, seq := range in.Set {
+    start := seq.Start
+    stop := seq.Stop
+    if stop == 0 {
+      // Some implementations may store a single value with Stop==0;
+      // normalize to a single-value range.
+      stop = start
+    }
+    if stop < start {
+      // Normalize if reversed (shouldn't happen, but safe)
+      start, stop = stop, start
+    }
+
+    // Walk the range and emit sub-ranges that fit in chunks.
+    for start <= stop {
+      remaining := chunkSize - curCount
+      if remaining == 0 {
+        flush()
+        remaining = chunkSize
+      }
+
+      end := start + uint32(remaining) - 1
+      if end > stop {
+        end = stop
+      }
+
+      cur.AddRange(start, end)
+      curCount += (end - start + 1)
+
+      if curCount == chunkSize {
+        flush()
+      }
+
+      if end == stop {
+        break
+      }
+      start = end + 1
     }
   }
-  if !currentChunk.Empty() {
-    chunks = append(chunks, currentChunk)
-  }
-  return chunks
+
+  flush()
+  return out
 }
 
 // Debug function to verify folder accessibility
@@ -483,6 +566,9 @@ func VerifyFolderAccess() {
 // Explicitly close the IMAP connection
 func CloseConnection() {
   fmt.Println("*** CloseConnection ***")
+  if c == nil {
+    return
+  }
   if err := c.Logout(); err != nil {
     fmt.Printf("failed to logout: %v\n", err)
     os.Exit(1)
@@ -646,4 +732,71 @@ func NormalizeCyrillic(r rune) rune {
     default:                             // Leave other characters unchanged
       return r
   }
+}
+
+// VerifyFolderCounts selects the given folders and logs their message counts.
+// This is read-only and does not modify any messages.
+func VerifyFolderCounts(folders ...string) {
+  for _, folder := range folders {
+    mbox, err := c.Select(folder, false)
+    if err != nil {
+      log.Printf("VerifyFolderCounts: failed to select %s: %v", folder, err)
+      continue
+    }
+    log.Printf("VerifyFolderCounts: %s contains %d messages.", folder, mbox.Messages)
+  }
+}
+
+// BuildFromEmailAddress returns "local@domain" in lowercase, plus the lowercase domain.
+// ok=false if the From field is missing or malformed.
+func BuildFromEmailAddress(msg *imap.Message) (emailAddress string, domain string, ok bool) {
+  if msg == nil || msg.Envelope == nil || len(msg.Envelope.From) == 0 {
+    return "", "", false
+  }
+  from := msg.Envelope.From[0]
+  local := strings.ToLower(strings.TrimSpace(from.MailboxName))
+  host := strings.ToLower(strings.TrimSpace(from.HostName))
+  if local == "" || host == "" {
+    return "", "", false
+  }
+  emailAddress = local + "@" + host
+  return emailAddress, host, true
+}
+
+// IsWhitelisted returns true if the sender is whitelisted by:
+// 1) exact full email match (entry contains '@')
+// 2) exact domain match (e.g. "gmail.com")
+// 3) wildcard domain match "*wellsfargo.com" which matches:
+//      wellsfargo.com, notify.wellsfargo.com, mail-wellsfargo.com
+//    but NOT wellsfargo.somejunk.com
+func IsWhitelisted(emailAddress, fromDomain string) bool {
+  for _, w := range Whitelist {
+    w = strings.TrimSpace(strings.ToLower(w))
+    if w == "" {
+      continue
+    }
+
+    // 1) Full email match
+    if strings.Contains(w, "@") {
+      if emailAddress == w {
+        return true
+      }
+      continue
+    }
+
+    // 2) Wildcard domain match: "*wellsfargo.com"
+    if strings.HasPrefix(w, "*") {
+        base := strings.TrimPrefix(w, "*")
+        if base != "" && strings.HasSuffix(fromDomain, base) {
+            return true
+        }
+        continue
+    }
+
+    // 3) Exact domain match: "gmail.com"
+    if fromDomain == w {
+      return true
+    }
+  }
+  return false
 }
