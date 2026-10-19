@@ -1,3 +1,0 @@
-{
-    "go.lintFlags": ["-config=staticcheck.conf"]
-}
