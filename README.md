@@ -1,6 +1,6 @@
 # SpamBeGone
 
-SpamBeGone is a Go-based email filtering application designed to help you manage your inbox by filtering out unwanted emails based on customizable blacklists and whitelists.
+SpamBeGone is a Go-based email filtering application that keeps messages from whitelisted senders in your inbox and moves messages from other valid senders to Trash.
 
 ## Table of Contents
 - [Features](#features)
@@ -10,10 +10,10 @@ SpamBeGone is a Go-based email filtering application designed to help you manage
 
 ## Features
 - Connects to your email server using IMAP.
-- Filters emails based on a blacklist of phrases.
-- Supports a whitelist to exclude specific email addresses from filtering.
-- Moves filtered emails to the trash folder.
-- Logs filtering metrics to `TrashMetrics.txt`.
+- Supports whitelist entries for email addresses, exact domains, and wildcard domain suffixes.
+- Leaves messages with missing or malformed sender fields in the inbox.
+- Moves messages from senders outside the whitelist to the trash folder.
+- Logs matching messages, batch progress, totals, and errors to console output.
 
 ## Usage
 1. **Build the application**:
@@ -34,20 +34,19 @@ SpamBeGone is a Go-based email filtering application designed to help you manage
      "password": "YourPassword"
    }
    ```
-2. **Create `Blacklist.txt`**:
-   - Add one or more phrases (e.g., words or sentences) that should be filtered from the Subject or Personal Name.
+2. **Create `Whitelist.txt`**:
+   - Add one entry per line. Matching ignores case and surrounding whitespace; blank lines are ignored.
+   - Use a full email address for one sender, a domain for that exact domain, or a leading `*` for a domain suffix.
    - Example:
      ```
-     Affordable Coverage
-     Black Friday
-     Landmark
+     friend@example.com
+     example.org
+     *example.net
      ```
-3. **Create `Whitelist.txt`**:
-   - Add email addresses that should be excluded from filtering.
-   - Example:
-     ```
-     somejunk@spamforyou.com
-     ```
+   - `example.org` matches only that domain. `*example.net` matches the apex domain and any domain ending in `example.net`, including `mail.example.net` and `mail-example.net`. `*.example.net` matches only subdomains.
+   - An empty whitelist keeps no valid senders; all messages with usable sender addresses are selected for Trash.
+
+Run the program with the project directory as its working directory so it can find `Config.json` and `Whitelist.txt`. It does not require a blacklist or write a metrics file.
 
 ## License
 This project is licensed under [The Unlicense](https://unlicense.org/).
