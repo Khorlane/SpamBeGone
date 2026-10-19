@@ -21,6 +21,7 @@ var (
 	password = ""
 	// Global variables
 	c              *client.Client
+	connectedAt    time.Time
 	mailbox        *imap.MailboxStatus
 	MatchingEmails []Email
 	// Constants
@@ -50,17 +51,30 @@ type Email struct {
 }
 
 func main() {
-	defer CloseConnection()
+	if err := run(); err != nil {
+		log.Printf("FATAL: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() (err error) {
+	defer func() {
+		if closeErr := CloseConnection(); err == nil {
+			err = closeErr
+		}
+	}()
 	fmt.Println("SpamBeGone v0.3")
 	LoadWhitelist()
 	LoadConfig()
-	ConnectLogin()
+	if err := ConnectLogin(); err != nil {
+		return err
+	}
 	VerifyFolderAccess()
 	ListMailboxes()
 	SelectMailbox()
 	FetchAndStoreEmails()
 	ListMatchingEmails()
-	MoveToTrash()
+	return MoveToTrash()
 }
 
 // Read the whitelist from Whitelist.txt
@@ -99,20 +113,19 @@ func LoadConfig() {
 }
 
 // Connect to the server and login
-func ConnectLogin() {
+func ConnectLogin() error {
 	fmt.Println("*** ConnectLogin ***")
 	var err error
 	c, err = client.DialTLS(server, nil)
 	if err != nil {
-		fmt.Printf("failed to connect to server: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("connect to server: %w", err)
 	}
+	connectedAt = time.Now()
 	if err := c.Login(email, password); err != nil {
-		c.Logout()
-		fmt.Printf("failed to login: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("login: %w", err)
 	}
 	fmt.Println("Connected and logged in successfully")
+	return nil
 }
 
 // List all available mailboxes
@@ -206,76 +219,45 @@ func ListMatchingEmails() {
 }
 
 // Move emails in the Email struct from the INBOX to the TrashFolder
-func MoveToTrash() {
+func MoveToTrash() error {
 	if !DoMoveToTrash {
 		fmt.Println("DoMoveToTrash is disabled. Skipping MoveToTrash.")
-		return
+		return nil
 	}
 	fmt.Println("*** MoveToTrash ***")
 	if len(MatchingEmails) == 0 {
 		fmt.Println("No emails to move to trash.")
-		return
+		return nil
 	}
-	// Reselect the mailbox to refresh its state
-	mbox, err := c.Select(SelectFolder, false)
-	if err != nil {
-		log.Fatalf("failed to reselect mailbox %s: %v", SelectFolder, err)
-	}
-	log.Printf("Mailbox %s reselected. Total messages: %d", SelectFolder, mbox.Messages)
 	seqset := new(imap.SeqSet)
 	for _, email := range MatchingEmails {
-		log.Printf("Adding UID to sequence set: %d", email.UID)
+		if email.UID == 0 {
+			return fmt.Errorf("cannot move message with zero UID")
+		}
 		seqset.AddNum(email.UID)
 	}
-	if seqset.Empty() {
-		log.Println("Sequence set is empty. No valid UIDs to process.")
-		return
+	mover := batchMover{
+		conn:        c,
+		connectedAt: connectedAt,
+		uidValidity: mailbox.UidValidity,
+		now:         time.Now,
+		pause:       time.Sleep,
+		reconnect: func() (batchClient, time.Time, error) {
+			select {
+			case <-c.LoggedOut():
+				return nil, time.Time{}, fmt.Errorf("connection closed unexpectedly before planned refresh")
+			default:
+			}
+			if err := CloseConnection(); err != nil {
+				return nil, time.Time{}, err
+			}
+			if err := ConnectLogin(); err != nil {
+				return nil, time.Time{}, err
+			}
+			return c, connectedAt, nil
+		},
 	}
-	// Debugging: Log the sequence set before processing
-	log.Printf("Sequence set for processing: %s", seqset.String())
-	// Split the sequence set into smaller chunks to avoid rate limits
-	chunks := SplitSequenceSet(seqset, 10) // Adjust chunk size as needed
-	for i, chunk := range chunks {
-		log.Printf("Processing chunk %d: %s", i+1, chunk.String())
-		// Copy emails to the Trash folder
-		if err := c.UidCopy(chunk, TrashFolder); err != nil {
-			log.Printf("FATAL: chunk %d copy to %s failed: %s (%v)", i+1, TrashFolder, chunk.String(), err)
-			// Show status of Trash/Bulk
-			VerifyFolderCounts(TrashFolder, "Trash/Bulk Mail")
-			// Clean logout before exiting
-			CloseConnection()
-			os.Exit(1)
-		}
-		log.Printf("Processed chunk %d: %s", i+1, chunk.String())
-		// Introduce a small delay to avoid rate limits
-		time.Sleep(2 * time.Second)
-	}
-	VerifyFolderCounts(TrashFolder, "Trash/Bulk Mail")
-	// Reselect INBOX so session state is clean
-	_, err = c.Select(SelectFolder, false)
-	if err != nil {
-		log.Printf("failed to reselect %s after folder verification: %v", SelectFolder, err)
-	}
-	// Mark original emails as deleted
-	storeFlags := []interface{}{imap.DeletedFlag}
-	item := imap.FormatFlagsOp(imap.AddFlags, true)
-	if err := c.UidStore(seqset, item, storeFlags, nil); err != nil {
-		log.Printf("failed to mark emails as deleted: %v", err)
-		return
-	}
-	// Expunge deleted emails
-	if err := c.Expunge(nil); err != nil {
-		log.Printf("failed to expunge emails: %v", err)
-		return
-	}
-	// Confirm INBOX count after expunge
-	mbox, err = c.Select(SelectFolder, false)
-	if err != nil {
-		log.Printf("failed to reselect %s after expunge: %v", SelectFolder, err)
-	} else {
-		log.Printf("Post-expunge: %s now contains %d messages.", SelectFolder, mbox.Messages)
-	}
-	log.Printf("%d emails moved to trash successfully.", len(MatchingEmails))
+	return mover.move(SplitSequenceSet(seqset, 10))
 }
 
 // Helper function to split a sequence set into smaller chunks
@@ -367,28 +349,21 @@ func VerifyFolderAccess() {
 }
 
 // Explicitly close the IMAP connection
-func CloseConnection() {
-	fmt.Println("*** CloseConnection ***")
+func CloseConnection() error {
 	if c == nil {
-		return
+		return nil
 	}
-	if err := c.Logout(); err != nil {
-		fmt.Printf("failed to logout: %v\n", err)
-		os.Exit(1)
+	fmt.Println("*** CloseConnection ***")
+	conn := c
+	c = nil
+	if conn.State() == imap.LogoutState {
+		return nil
 	}
-}
-
-// VerifyFolderCounts selects the given folders and logs their message counts.
-// This is read-only and does not modify any messages.
-func VerifyFolderCounts(folders ...string) {
-	for _, folder := range folders {
-		mbox, err := c.Select(folder, false)
-		if err != nil {
-			log.Printf("VerifyFolderCounts: failed to select %s: %v", folder, err)
-			continue
-		}
-		log.Printf("VerifyFolderCounts: %s contains %d messages.", folder, mbox.Messages)
+	if err := conn.Logout(); err != nil {
+		conn.Terminate()
+		return fmt.Errorf("logout: %w", err)
 	}
+	return nil
 }
 
 // BuildFromEmailAddress returns "local@domain" in lowercase, plus the lowercase domain.

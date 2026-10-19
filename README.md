@@ -48,5 +48,11 @@ SpamBeGone is a Go-based email filtering application that keeps messages from wh
 
 Run the program with the project directory as its working directory so it can find `Config.json` and `Whitelist.txt`. It does not require a blacklist or write a metrics file.
 
+Messages are processed in batches of up to 10 UIDs. Each batch is copied to Trash, marked deleted in INBOX, and removed using `UID EXPUNGE` before the next batch starts. The server must support UIDPLUS so other messages marked deleted are left alone.
+
+Between batches, the program pauses for two seconds. Before starting another batch, it refreshes connections that are at least four minutes old, including time spent logging in and scanning the inbox. After reconnecting, it checks INBOX's UIDVALIDITY before continuing with the remaining UIDs.
+
+Unexpected disconnects and command failures stop the run with a nonzero exit code; operations are not retried. Completed batches remain moved. If a batch fails during copying or deletion, that batch may have copies in Trash and originals remaining in INBOX; the error log identifies the batch and the failing stage.
+
 ## License
 This project is licensed under [The Unlicense](https://unlicense.org/).
